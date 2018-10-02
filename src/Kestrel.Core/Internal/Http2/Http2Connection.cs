@@ -224,7 +224,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
                     catch (Http2StreamErrorException ex)
                     {
                         Log.Http2StreamError(ConnectionId, ex);
-                        AbortStream(_incomingFrame.StreamId, new IOException(ex.Message, ex));
+                        // The client doesn't know this error is coming, allow draining additional frames for now.
+                        AbortStream(_incomingFrame.StreamId, drain: true, new IOException(ex.Message, ex));
                         await _frameWriter.WriteRstStreamAsync(ex.StreamId, ex.ErrorCode);
                     }
                     finally
@@ -292,7 +293,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
 
                     foreach (var stream in _streams.Values)
                     {
-                        stream.Abort(new IOException(CoreStrings.Http2StreamAborted, connectionError));
+                        stream.Abort(new IOException(CoreStrings.Http2StreamAborted, connectionError), drain: true);
                     }
 
                     await _streamsCompleted.Task;
@@ -448,6 +449,11 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
 
             if (_streams.TryGetValue(_incomingFrame.StreamId, out var stream))
             {
+                if (stream.DoNotDrain)
+                {
+                    // Hard abort, do not allow any more frames on this stream.
+                    throw new Http2ConnectionErrorException(CoreStrings.FormatHttp2ErrorStreamAborted(_incomingFrame.Type, stream.StreamId), Http2ErrorCode.STREAM_CLOSED);
+                }
                 if (stream.EndStreamReceived)
                 {
                     // http://httpwg.org/specs/rfc7540.html#rfc.section.5.1
@@ -501,6 +507,12 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
 
             if (_streams.TryGetValue(_incomingFrame.StreamId, out var stream))
             {
+                if (stream.DoNotDrain)
+                {
+                    // Hard abort, do not allow any more frames on this stream.
+                    throw new Http2ConnectionErrorException(CoreStrings.FormatHttp2ErrorStreamAborted(_incomingFrame.Type, stream.StreamId), Http2ErrorCode.STREAM_CLOSED);
+                }
+
                 // http://httpwg.org/specs/rfc7540.html#rfc.section.5.1
                 //
                 // ...an endpoint that receives any frames after receiving a frame with the
@@ -609,7 +621,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
             }
 
             ThrowIfIncomingFrameSentToIdleStream();
-            AbortStream(_incomingFrame.StreamId, new IOException(CoreStrings.Http2StreamResetByClient));
+            // No additional inbound header or data frames are allowed for this stream after receiving a reset.
+            AbortStream(_incomingFrame.StreamId, drain: false, new IOException(CoreStrings.Http2StreamResetByClient));
 
             return Task.CompletedTask;
         }
@@ -923,11 +936,11 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
             }
         }
 
-        private void AbortStream(int streamId, IOException error)
+        private void AbortStream(int streamId, bool drain, IOException error)
         {
             if (_streams.TryGetValue(streamId, out var stream))
             {
-                stream.Abort(error);
+                stream.Abort(error, drain);
             }
         }
 
